@@ -1,12 +1,10 @@
 use async_trait::async_trait;
 use deadpool::managed::{Metrics, Object, RecycleError, RecycleResult, Timeouts};
 use deadpool::Status;
-// use futures_core::future::BoxFuture;
+use futures_core::future::BoxFuture;
 use rbdc::db::{Connection, ExecResult, Row};
-use rbdc::pool::conn_box::ConnectionBox;
-use rbdc::pool::conn_manager::ConnManager;
-use rbdc::pool::Pool;
-use rbdc::{db, Error};
+use rbdc::pool::{ConnectionGuard, ConnectionManager, Pool};
+use rbdc::Error;
 use rbs::value::map::ValueMap;
 use rbs::{to_value, Value};
 use std::fmt::{Debug, Formatter};
@@ -36,7 +34,7 @@ impl DeadPool {
 
 #[async_trait]
 impl Pool for DeadPool {
-    fn new(manager: ConnManager) -> Result<Self, Error>
+    fn new(manager: ConnectionManager) -> Result<Self, Error>
     where
         Self: Sized,
     {
@@ -66,9 +64,11 @@ impl Pool for DeadPool {
     }
 
     async fn get_timeout(&self, d: Duration) -> Result<Box<dyn Connection>, Error> {
-        let mut out = Timeouts::default();
-        out.create = Some(d);
-        out.wait = Some(d);
+        let out = Timeouts {
+            create: Some(d),
+            wait: Some(d),
+            recycle: None,
+        };
         let v = self.inner.timeout_get(&out).await.map_err(|e| Error::from(e.to_string()))?;
         let conn = ConnManagerProxy {
             inner: v.manager_proxy.clone(),
@@ -105,21 +105,31 @@ impl Pool for DeadPool {
 }
 
 pub struct ConnManagerProxy {
-    pub inner: ConnManager,
+    pub inner: ConnectionManager,
     pub conn: Option<Object<ConnManagerProxy>>,
+}
+
+impl From<ConnectionManager> for ConnManagerProxy {
+    fn from(value: ConnectionManager) -> Self {
+        ConnManagerProxy {
+            inner: value,
+            conn: None,
+        }
+    }
 }
 
 // #[async_trait]
 impl deadpool::managed::Manager for ConnManagerProxy {
-    type Type = ConnectionBox;
-
+    type Type = ConnectionGuard;
     type Error = Error;
 
     async fn create(&self) -> Result<Self::Type, Self::Error> {
         self.inner.connect().await
     }
 
-    async fn recycle(&self, obj: &mut Self::Type, _metrics: &Metrics) -> RecycleResult<Self::Error> {
+    async fn recycle(
+        &self, obj: &mut Self::Type, _metrics: &Metrics,
+    ) -> RecycleResult<Self::Error> {
         if obj.conn.is_none() {
             return Err(RecycleError::Message("none".into()));
         }
@@ -128,14 +138,17 @@ impl deadpool::managed::Manager for ConnManagerProxy {
     }
 }
 
-use std::future::Future;
-use std::pin::Pin;
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+// use std::future::Future;
+// pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-impl db::Connection for ConnManagerProxy {
-    fn get_rows(&mut self, sql: &str, params: Vec<Value>) -> BoxFuture<Result<Vec<Box<dyn Row>>, Error>> {
+impl Connection for ConnManagerProxy {
+    fn get_rows(
+        &mut self, sql: &str, params: Vec<Value>,
+    ) -> BoxFuture<Result<Vec<Box<dyn Row>>, Error>> {
         if self.conn.is_none() {
-            return Box::pin(async { Err(Error::from("conn is drop")) });
+            return Box::pin(async {
+                Err::<Vec<Box<dyn Row>>, Error>(Error::from("conn is drop"))
+            });
         }
         self.conn.as_mut().unwrap().get_rows(sql, params)
     }
@@ -159,6 +172,25 @@ impl db::Connection for ConnManagerProxy {
             return Box::pin(async { Err(Error::from("conn is drop")) });
         }
         Box::pin(async { self.conn.as_mut().unwrap().close().await })
+    }
+
+    fn begin(&mut self) -> BoxFuture<Result<(), Error>> {
+        if self.conn.is_none() {
+            return Box::pin(async { Err(Error::from("conn is drop")) });
+        }
+        self.conn.as_mut().unwrap().begin()
+    }
+    fn commit(&mut self) -> BoxFuture<Result<(), Error>> {
+        if self.conn.is_none() {
+            return Box::pin(async { Err(Error::from("conn is drop")) });
+        }
+        self.conn.as_mut().unwrap().commit()
+    }
+    fn rollback(&mut self) -> BoxFuture<Result<(), Error>> {
+        if self.conn.is_none() {
+            return Box::pin(async { Err(Error::from("conn is drop")) });
+        }
+        self.conn.as_mut().unwrap().rollback()
     }
 }
 
